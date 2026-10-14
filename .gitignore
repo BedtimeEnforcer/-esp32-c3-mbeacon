@@ -1,0 +1,4 @@
+ESP32_BLE_Clone/.pio/
+reference/
+release/*
+!release/MBeacon_LuatOS_C3_USB_2026-10-14_v2.zip

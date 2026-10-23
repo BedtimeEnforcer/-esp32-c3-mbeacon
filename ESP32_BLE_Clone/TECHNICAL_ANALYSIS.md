@@ -1,37 +1,30 @@
-# 技术分析与参考仓库核查
+# 一些技术笔记
 
-## 参考仓库
+写固件时查过、试过的东西记在这里，免得以后忘了为什么这么写。设计依据是 ESP32-C3 和 NimBLE-Arduino 的公开接口文档。
 
-`home_wt/simulate-time-clock-release` 的本地完整克隆提交为 `c8becb6f73ab322441cef902ce686625a332df1c`。提交树只有 USB 串口驱动、烧录工具 ZIP、两个手机工具 APK、一个网址 TXT 和空 README；无 Arduino/ESP-IDF 源码。不能从它推断 BLE 初始化、MAC 设置、广播数据构造、payload 布局或是否支持 GATT。核查证据详见 `../reference/reference-notes.md`。
+## 扫描和学习
 
-设计依据转为 ESP32-C3 与 NimBLE-Arduino 的公开接口，而不是该仓库的二进制固件。
+- 没有按 MAC 的硬件过滤，就是全量扫描回来在代码里按地址比对。目标如果用随机地址、会定期换，固定 MAC 就盯不住。
+- 主动扫描，周期 100 ms、窗口 90 ms，一直扫到成功为止，没有 30 秒超时一说。
+- 判定学成功的条件比"看见目标 MAC"严：要收到一整套对得上 MBeacon 格式的 ADV + Scan Response（iBeacon 厂商字段、0xFDA5 服务数据、MBeacon 名称都在）。学到后写 NVS 并读回校验，跟已保存的快照相同就不重复写。
+- 扫描输出里 Raw Advertisement Packet 和 Raw Scan Response 是分开打的，别把扫描响应跟 ADV 当成同一个空中包。
 
-## 能力与边界
+## 广播重播
 
-| 问题 | 判定 |
-|---|---|
-| 扫描指定 MAC | 支持；实际是扫描全部广播后按地址过滤。随机地址变化时固定 MAC 过滤会失效。 |
-| 自定义 manufacturer / service data | 支持，可构造 AD 字段；本工程直接保存和重播收到的 AD 字节。 |
-| 自定义广播地址 | NimBLE-Arduino 的 `setOwnAddr` 设随机地址，`setOwnAddrType` 选随机地址。本工程仅对合法随机静态目标地址使用相同地址。ESP-IDF 也允许初始化前设置自定义 base MAC，并由它派生 Bluetooth 公共地址；本版未实现该启动流程。 |
-| 完整复制目标广播 | 不能保证。可复现传统广播的 ADV/Scan Response AD 字节；地址类型、PDU 类型、间隔、功率及连接行为存在限制。 |
+- manufacturer / service data 都能自定义构造，本工程图省事，直接保存收到的 AD 原始字节再原样重播。
+- 广播地址只能走 NimBLE 的 setOwnAddr 设随机地址；本工程只对合法的随机静态目标地址用同地址重播。想用任意公共地址得在初始化前设自定义 base MAC（ESP-IDF 支持），本版没做这条路。
+- 所以重播不是完整克隆：AD 字节能对上，但地址类型、PDU 类型、广播间隔、功率、能不能被连接，这些都没法保证跟原设备一模一样。
 
-扫描模式输出 `MAC / RSSI / Advertisement Type / Service UUID / Manufacturer Data / Service Data / Raw Advertisement Packet / Raw Scan Response`。后一项单独输出，避免把扫描响应与 ADV 误当同一空中包。
+## 存储
 
-日常学习采用主动扫描、100 ms 扫描周期中的 90 ms 窗口，持续到成功，不设置固定 30 秒超时。BLE 设备多时回调先过滤目标 MAC；只有收到符合当前 MBeacon 格式的完整 ADV 与 Scan Response（iBeacon 厂商字段、0xFDA5 服务数据和 MBeacon 名称）才认为学习成功。变化时写入 NVS 并读回校验；相同值沿用已保存快照。之后先启动广播，成功后 D4 常亮 3 秒、熄灭 0.2 秒，再慢闪。若未收到合格数据则继续快闪扫描。这样灯号表明收到完整可重播的数据，而不只是看见目标 MAC。
+NVS 里只存一个 snapshot blob：一份里放齐 deviceMac、rawData（ADV 和 Scan Response 按顺序合并，两个包的长度单独记）、地址类型、广播类型、更新时间。一次写一份，是怕掉电时多个 key 写一半互相不一致。updatedEpoch 只有在串口发过 TIME 之后才是真实时间，板子本身没有后备时钟。
 
-公共地址的硬件能力依据：[Espressif ESP32-C3 MAC 地址说明](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-reference/system/misc_system_api.html)。自定义 base MAC 必须在初始化无线接口前设置，也会改变同芯片派生的其他接口地址；不能在扫描到目标后直接用当前 `setOwnAddr` 路径切换为任意公共地址。
+## 板子（合宙 ESP32C3-CORE）
 
-NVS 使用一个 `snapshot` blob，内含 `deviceMac`、`rawData`、`rawLength`、`updatedEpoch`、`updatedUptimeMs`、地址类型、广播类型和完整 AD 字节。`rawData` 为 ADV 与 Scan Response 按顺序合并后的字节，两个包的长度单独保存；任一包变化就更新。单次写入一份快照，减少掉电时多个 key 之间出现不一致的机会。由于没有板载后备时钟，`updatedEpoch` 只有在串口设置 `TIME` 后才有绝对时间意义。
+- 官方资料：4 MB Flash、BOOT 是 GPIO9、D4 是 GPIO12、D5 是 GPIO13。本工程拿 BOOT 做模式切换、D4 做状态灯，不用焊东西。注意 BOOT 要在正常启动之后再按，按住 BOOT 复位是进下载模式。
+- GPIO12 能当 LED 用，前提是这块板是外置 Flash、DIO 模式，所以构建和合并镜像都固定 DIO。拿到内置 Flash 变体的别直接套这份配置。
+- 这块板有 CH343 串口的经典版和原生 USB 直连版，所以固件出两份：luatos_classic（UART0 的 Serial）和 luatos_usb（USB CDC 的 Serial），BLE 逻辑一样。
 
-工程结构：`src/main.cpp` 处理模式与命令，`ble_scanner.*` 负责扫描入队，`ble_advertiser.*` 负责广播，`storage.*` 负责 NVS/LittleFS，`button.*` 负责消抖，`include/config.h` 放硬件与目标配置。
+## 还没在实物上验证的
 
-## 合宙 ESP32C3-CORE 板级适配
-
-合宙官方板资料列出 4 MB Flash、BOOT/GPIO9、D4/GPIO12 和 D5/GPIO13。工程使用板载 BOOT 做模式切换、D4 做快慢闪，无需焊接。BOOT 在正常启动后才可按；按住 BOOT 再复位会进入下载模式。GPIO12 能作为 LED 是以该板使用外置 Flash、DIO 模式为前提；因此构建与合并镜像均固定 DIO。若拿到的是内置 Flash 变体，不能直接套用这份板级配置。
-
-官方文档还区分 CH343 USB-UART 经典版与原生 USB 直连版。本工程分别构建 `luatos_classic`（UART0 `Serial`）和 `luatos_usb`（USB Serial/JTAG CDC `Serial`）两份固件。两者的 BLE 逻辑相同。参见[合宙板卡资料](https://wiki-zh.luatos.org/chips/esp32c3/board.html)。
-
-## 现场验证门槛
-
-软件编译通过只能确认 API 与语法。用户已提供一份 MBeacon 合并样本，详见 `MBEACON_CAPTURE.md`。以下仍需实物测量：目标地址类型与广播类型、ADV/Scan Response 分界的现场确认、广播变化规律、手机 App 是否依赖连接/GATT/配对。单一样本不能证明手机 App 会接受模拟结果。
-
+编译通过只说明 API 和语法没问题。下面这些要拿真板子测才算数：目标的地址类型和广播类型、ADV/Scan Response 的分界对不对、目标广播会不会变、手机 App 是否还依赖连接或配对。目前只有一个 MBeacon 抓包样本（见 MBEACON_CAPTURE.md），单一样本说明不了 App 就一定认这个重播。
